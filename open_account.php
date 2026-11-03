@@ -58,7 +58,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             if (file_exists($banks_file)) {
                 $decoded = json_decode(file_get_contents($banks_file), true);
                 if (is_array($decoded) && !empty($decoded)) {
-                    $names = array_values(array_filter(array_map(fn($b) => trim($b['name'] ?? ''), $decoded)));
+                    $names = array_values(array_filter(array_map(function ($b) { return trim(isset($b['name']) ? $b['name'] : ''); }, $decoded)));
                     if ($names) $bank_names = $names;
                 }
             }
