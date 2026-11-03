@@ -4,6 +4,10 @@
 // Поддержка валют: чякө и песета (₧). 1 чякө = 10 ₧
 // ================================================================
 
+error_reporting(E_ALL);
+ini_set('display_errors', '0');
+mb_internal_encoding('UTF-8');
+
 // ===== НАСТРОЙКИ =====
 define('ACCOUNTS_DIR', 'accounts/');
 define('PROPERTIES_FILE', 'properties.txt');
@@ -21,6 +25,17 @@ define('CURRENCY_PESETA', 'песета');
 define('PESETA_SYMBOL', '₧');
 define('CHAKO_PER_PESETA', 10);
 define('BOND_PRICE', 5);
+define('EXTERNAL_TRANSFERS_FILE', 'external_transfers.txt');
+
+// ===== ЖУРНАЛ ТРАНЗАКЦИЙ =====
+// Единый формат строки external_transfers.txt (используют index.php, api.php, process_transaction.php):
+// дата|ID транзакции|получатель|отправитель|сумма|описание|валюта
+function log_transaction($external_id, $recipient, $sender, $amount, $description, $currency) {
+    $line = date('Y-m-d H:i:s') . '|' . $external_id . '|' . $recipient . '|' . $sender . '|'
+          . rtrim(rtrim(number_format((float)$amount, 2, '.', ''), '0'), '.') . '|'
+          . str_replace(["\n", "\r", '|'], ' ', $description) . '|' . normalize_currency($currency) . "\n";
+    file_put_contents(EXTERNAL_TRANSFERS_FILE, $line, FILE_APPEND | LOCK_EX);
+}
 
 // ===== ВАЛЮТНЫЕ ХЕЛПЕРЫ =====
 function normalize_currency($cur) {
@@ -78,7 +93,9 @@ function generate_account_number() {
 function get_account_data($account_number) {
     $filename = ACCOUNTS_DIR . $account_number . '.txt';
     if (!file_exists($filename)) return false;
-    $data = file($filename, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    // FILE_IGNORE_NEW_LINES без FILE_SKIP_EMPTY_LINES — пустые строки
+    // (например, пустое поле last_payment у сотрудников) сохраняют индексы полей
+    $data = file($filename, FILE_IGNORE_NEW_LINES);
     if (count($data) < 3) return false;
     $currency = normalize_currency($data[4] ?? CURRENCY_CHAKO);
     return [
@@ -101,8 +118,10 @@ function get_account_balance($num) {
 function update_account_balance($num, $new_balance) {
     $filename = ACCOUNTS_DIR . $num . '.txt';
     if (!file_exists($filename)) return false;
-    $data = file($filename, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    $data = file($filename, FILE_IGNORE_NEW_LINES);
     if (count($data) < 3) return false;
+    $new_balance = round((float)$new_balance, 2);
+    if ($new_balance < 0) $new_balance = 0.0; // балансы не могут быть отрицательными
     $data[2] = number_format($new_balance, 2, '.', '');
     return file_put_contents($filename, implode("\n", $data) . "\n") !== false;
 }
@@ -111,7 +130,7 @@ function get_all_accounts() {
     if (!is_dir(ACCOUNTS_DIR)) return $accounts;
     foreach (scandir(ACCOUNTS_DIR) as $file) {
         if ($file === '.' || $file === '..' || pathinfo($file, PATHINFO_EXTENSION) !== 'txt') continue;
-        $data = file(ACCOUNTS_DIR . $file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        $data = file(ACCOUNTS_DIR . $file, FILE_IGNORE_NEW_LINES);
         if (count($data) >= 3) {
             $accounts[] = [
                 'account_number' => pathinfo($file, PATHINFO_FILENAME),
@@ -196,7 +215,7 @@ function get_salary_employers() {
     if (!is_dir(SALARY_EMPLOYERS_DIR)) return $employers;
     foreach (scandir(SALARY_EMPLOYERS_DIR) as $file) {
         if ($file === '.' || $file === '..' || pathinfo($file, PATHINFO_EXTENSION) !== 'txt') continue;
-        $data = file(SALARY_EMPLOYERS_DIR . $file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        $data = file(SALARY_EMPLOYERS_DIR . $file, FILE_IGNORE_NEW_LINES);
         if (count($data) >= 3) {
             $employers[] = [
                 'id' => pathinfo($file, PATHINFO_FILENAME),
@@ -213,7 +232,7 @@ function get_salary_employees($employer_id = null) {
     if (!is_dir(SALARY_EMPLOYEES_DIR)) return $employees;
     foreach (scandir(SALARY_EMPLOYEES_DIR) as $file) {
         if ($file === '.' || $file === '..' || pathinfo($file, PATHINFO_EXTENSION) !== 'txt') continue;
-        $data = file(SALARY_EMPLOYEES_DIR . $file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        $data = file(SALARY_EMPLOYEES_DIR . $file, FILE_IGNORE_NEW_LINES);
         if (count($data) >= 5) {
             $emp = [
                 'id' => pathinfo($file, PATHINFO_FILENAME),
@@ -532,7 +551,7 @@ if ($action === 'open_account' && $method === 'POST') {
     $currency = normalize_currency($_POST['currency'] ?? CURRENCY_CHAKO);
     if (empty($owner) || empty($bank)) { echo json_encode(['success' => false, 'message' => 'Все поля обязательны']); exit; }
     $num = generate_account_number();
-    $data = "$owner\n$bank\n$balance\n$type\n$currency";
+    $data = "$owner\n$bank\n" . number_format($balance, 2, '.', '') . "\n$type\n$currency";
     if (!is_dir(ACCOUNTS_DIR)) mkdir(ACCOUNTS_DIR, 0777, true);
     if (file_put_contents(ACCOUNTS_DIR . $num . '.txt', $data)) {
         echo json_encode(['success' => true, 'message' => 'Счёт создан', 'account_number' => $num, 'currency' => $currency]);
@@ -562,7 +581,7 @@ if ($action === 'update_account' && $method === 'POST') {
     if (empty($num) || empty($org) || empty($bank)) { echo json_encode(['success' => false, 'message' => 'Все поля обязательны']); exit; }
     $file = ACCOUNTS_DIR . $num . '.txt';
     if (!file_exists($file)) { echo json_encode(['success' => false, 'message' => 'Не найден']); exit; }
-    $data = "$org\n$bank\n$balance\n$type\n$currency";
+    $data = "$org\n$bank\n" . number_format($balance, 2, '.', '') . "\n$type\n$currency";
     if (file_put_contents($file, $data)) echo json_encode(['success' => true, 'message' => 'Обновлено']);
     else echo json_encode(['success' => false, 'message' => 'Ошибка']);
     exit;
@@ -629,6 +648,7 @@ if ($action === 'transfer' && $method === 'POST') {
     $amount_to_rec = round(convert_amount($amount, $s['currency'], $r['currency']), 2);
     if (update_account_balance($sender, $s['balance'] - $amount)
         && update_account_balance($rec, $r['balance'] + $amount_to_rec)) {
+        log_transaction('web_' . round(microtime(true) * 1000), $rec, $sender, $amount, 'Перевод внутри банка', $s['currency']);
         $msg = "Перевод выполнен: {$amount} " . currency_short($s['currency']);
         if ($s['currency'] !== $r['currency']) {
             $msg .= " → {$amount_to_rec} " . currency_short($r['currency']) . " (курс 1 чякө = " . CHAKO_PER_PESETA . " ₧)";
@@ -647,7 +667,9 @@ if ($action === 'issue_loan' && $method === 'POST') {
     if (empty($acc) || $amount <= 0) { echo json_encode(['success' => false, 'message' => 'Некорректные данные']); exit; }
     $d = get_account_data($acc);
     if (!$d) { echo json_encode(['success' => false, 'message' => 'Не найден']); exit; }
+    // Сумма кредита указывается в валюте счёта заёмщика
     if (update_account_balance($acc, $d['balance'] + $amount)) {
+        log_transaction('loan_' . round(microtime(true) * 1000), $acc, 'банк', $amount, 'Выдача кредита', $d['currency']);
         echo json_encode(['success' => true, 'message' => "Кредит на $amount " . currency_short($d['currency']) . " выдан"]);
     } else {
         echo json_encode(['success' => false, 'message' => 'Ошибка']);
@@ -669,6 +691,29 @@ if ($action === 'add_property' && $method === 'POST') {
     $data = "$name|$id|$addr|$area|$prov|$year|$price|$currency\n";
     if (file_put_contents(PROPERTIES_FILE, $data, FILE_APPEND)) echo json_encode(['success' => true, 'message' => 'Добавлено']);
     else echo json_encode(['success' => false, 'message' => 'Ошибка']);
+    exit;
+}
+
+// Удаление объекта недвижимости (по ID или названию) — тот же алгоритм, что в delete_property.php
+if ($action === 'delete_property' && $method === 'POST') {
+    header('Content-Type: application/json');
+    $property_id = trim($_POST['property_id'] ?? '');
+    if (empty($property_id)) { echo json_encode(['success' => false, 'message' => 'ID объекта обязателен']); exit; }
+    if (!file_exists(PROPERTIES_FILE)) { echo json_encode(['success' => false, 'message' => 'Файл объектов не найден']); exit; }
+    $lines = file(PROPERTIES_FILE, FILE_IGNORE_NEW_LINES);
+    $kept = []; $removed = null;
+    foreach ($lines as $line) {
+        if (trim((string)$line) === '') continue;
+        $d = explode('|', $line);
+        if (isset($d[1]) && ($d[1] === $property_id || $d[0] === $property_id)) { $removed = $d[0]; continue; }
+        $kept[] = $line;
+    }
+    if ($removed === null) { echo json_encode(['success' => false, 'message' => 'Объект не найден']); exit; }
+    $content = $kept ? implode("\n", $kept) . "\n" : "";
+    if (file_put_contents(PROPERTIES_FILE, $content, LOCK_EX) !== false)
+        echo json_encode(['success' => true, 'message' => "Объект '$removed' удалён"]);
+    else
+        echo json_encode(['success' => false, 'message' => 'Ошибка сохранения']);
     exit;
 }
 
@@ -722,10 +767,12 @@ if ($action === 'buy_property' && $method === 'POST') {
     $sold_file = SOLD_PROPERTIES_DIR . 'sold_' . $sale . '.txt';
     $sold_data = "Sale Number: $sale\nProperty: " . implode(' | ', $pdata) . "\nBuyer Account: $num\nDate: " . date('Y-m-d H:i:s') . "\n";
     file_put_contents($sold_file, $sold_data);
-    file_put_contents(PURCHASES_FILE, "$prop|$sale|$num\n", FILE_APPEND);
+    // Единый формат purchases.txt: название|ID продажи|счёт покупателя|цена для покупателя|валюта покупателя
+    file_put_contents(PURCHASES_FILE, "$prop|$sale|$num|$price_for_buyer|{$buyer['currency']}\n", FILE_APPEND);
     unset($props[$idx]);
-    file_put_contents(PROPERTIES_FILE, implode("\n", $props));
+    file_put_contents(PROPERTIES_FILE, implode("\n", array_filter($props, fn($l) => trim((string)$l) !== '')));
     update_account_balance($num, $buyer['balance'] - $price_for_buyer);
+    log_transaction('sale_' . $sale, '983902849056', $num, $price_for_buyer, "Покупка объекта: $prop", $buyer['currency']);
 
     $special = '983902849056';
     $sp = get_account_data($special);
@@ -761,6 +808,37 @@ if ($action === 'repay_loan' && $method === 'POST') {
     echo json_encode(repay_loan($lid, $oacc, $q)); exit;
 }
 if ($action === 'get_loan_holders' && isset($_GET['loan_id'])) { header('Content-Type: application/json'); echo json_encode(get_loan_holders(trim($_GET['loan_id']))); exit; }
+
+// ===== ЖУРНАЛ ТРАНЗАКЦИЙ =====
+// GET ?action=get_transactions&account=<номер>&limit=50
+// account не указан — все последние операции. Ответ: массив записей (суммы в валюте отправителя).
+if ($action === 'get_transactions') {
+    header('Content-Type: application/json');
+    $acc = trim($_GET['account'] ?? '');
+    $limit = max(1, intval($_GET['limit'] ?? 100));
+    $result = [];
+    if (file_exists(EXTERNAL_TRANSFERS_FILE)) {
+        $lines = file(EXTERNAL_TRANSFERS_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        foreach (array_reverse($lines) as $line) {
+            $p = explode('|', $line);
+            if (count($p) < 6) continue;
+            $entry = [
+                'date' => $p[0],
+                'id' => $p[1],
+                'recipient' => $p[2],
+                'sender' => $p[3],
+                'amount' => floatval($p[4]),
+                'description' => $p[5],
+                'currency' => normalize_currency($p[6] ?? CURRENCY_CHAKO),
+            ];
+            if ($acc !== '' && $entry['recipient'] !== $acc && $entry['sender'] !== $acc) continue;
+            $result[] = $entry;
+            if (count($result) >= $limit) break;
+        }
+    }
+    echo json_encode(['success' => true, 'data' => $result, 'count' => count($result)]);
+    exit;
+}
 
 // ===== ЗАРПЛАТА: работодатели =====
 if ($action === 'create_employer' && $method === 'POST') {
@@ -827,7 +905,7 @@ if ($action === 'update_employee' && $method === 'POST') {
     if (!file_exists(ACCOUNTS_DIR . $acc . '.txt')) {
         echo json_encode(['success' => false, 'message' => 'Счёт не найден']); exit;
     }
-    $emp_data = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    $emp_data = file($file, FILE_IGNORE_NEW_LINES);
     if (count($emp_data) < 5) {
         echo json_encode(['success' => false, 'message' => 'Некорректные данные']); exit;
     }
@@ -873,7 +951,7 @@ if ($action === 'pay_salary' && $method === 'POST') {
 
     $emp_file = SALARY_EMPLOYEES_DIR . $eid . '.txt';
     if (!file_exists($emp_file)) { echo json_encode(['success' => false, 'message' => 'Сотрудник не найден']); exit; }
-    $emp_data = file($emp_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    $emp_data = file($emp_file, FILE_IGNORE_NEW_LINES);
     if (count($emp_data) < 5) { echo json_encode(['success' => false, 'message' => 'Некорректные данные']); exit; }
 
     $employer_id = $emp_data[0];
@@ -884,7 +962,7 @@ if ($action === 'pay_salary' && $method === 'POST') {
 
     $employer_file = SALARY_EMPLOYERS_DIR . $employer_id . '.txt';
     if (!file_exists($employer_file)) { echo json_encode(['success' => false, 'message' => 'Работодатель не найден']); exit; }
-    $employer_data = file($employer_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    $employer_data = file($employer_file, FILE_IGNORE_NEW_LINES);
     if (count($employer_data) < 2) { echo json_encode(['success' => false, 'message' => 'Некорректные данные']); exit; }
     $employer_account = $employer_data[1];
 
@@ -915,7 +993,12 @@ if ($action === 'pay_salary' && $method === 'POST') {
     }
 
     $emp_data[5] = date('Y-m-d H:i:s');
+    while (count($emp_data) < 7) $emp_data[] = ''; // нормализуем длину до 7 полей
+    $emp_data[6] = $salary_currency;
     file_put_contents($emp_file, implode("\n", $emp_data) . "\n");
+
+    log_transaction('salary_' . round(microtime(true) * 1000), $employee_account, $employer_account,
+        $amount_to_employee, "Зарплата: $employee_name ($months мес.)", $employee_acc['currency']);
 
     // История — в чякө
     $history_file = SALARY_HISTORY_DIR . $eid . '.txt';
@@ -1682,6 +1765,7 @@ if ($action === 'delete_employer' && $method === 'POST') {
     }
     .history-table td strong { color: var(--ink); font-weight: 600; }
     .history-table tr:hover td { background: var(--surface-soft); }
+    .tx-alt { font-size: 11px; color: var(--ink-mute); margin-top: 2px; font-weight: 500; }
 
     /* ===== MISC ===== */
     .footer {
@@ -1750,6 +1834,7 @@ if ($action === 'delete_employer' && $method === 'POST') {
             <li><a data-page="bonds"><i class="fas fa-chart-pie"></i> Облигации</a></li>
             <li><a data-page="property"><i class="fas fa-building"></i> Маеток</a></li>
             <li><a data-page="salary"><i class="fas fa-wallet"></i> Сөләр</a></li>
+            <li><a data-page="transactions"><i class="fas fa-exchange-alt"></i> Операции</a></li>
             <li><a data-page="analytics"><i class="fas fa-chart-pie"></i> Аналитика</a></li>
             <li><a data-page="banks"><i class="fas fa-university"></i> Пәнкәв</a></li>
         </ul>
@@ -1967,6 +2052,26 @@ if ($action === 'delete_employer' && $method === 'POST') {
                         </div>
                         <div id="historyContent"><p class="text-muted">Выберите сотрудника</p></div>
                     </div>
+                </div>
+            </div>
+
+            <div id="page-transactions" class="tab-content">
+                <div class="content-card">
+                    <h2><i class="fas fa-exchange-alt"></i> Операции</h2>
+                    <p class="text-muted mb-16">Единый журнал транзакций: переводы, зарплаты, кредиты, покупка объектов. Суммы указаны в валюте отправителя, автоматически пересчитаны во вторую валюту (курс 1 чякө = 10 ₧).</p>
+                    <div class="flex gap-8 mb-16" style="flex-wrap:wrap;">
+                        <input type="text" class="form-control" id="txAccount" placeholder="Номер счёта (отправитель или получатель)" style="max-width:320px;" onkeydown="if(event.key==='Enter'){event.preventDefault();loadTransactions();}">
+                        <select class="form-control" id="txLimit" style="max-width:140px;">
+                            <option value="50">50 записей</option>
+                            <option value="100" selected>100 записей</option>
+                            <option value="200">200 записей</option>
+                            <option value="500">500 записей</option>
+                        </select>
+                        <button class="btn btn-secondary" onclick="loadTransactions()"><i class="fas fa-search"></i> Показать</button>
+                        <button class="btn btn-secondary" onclick="document.getElementById('txAccount').value='';loadTransactions()"><i class="fas fa-sync"></i> Все операции</button>
+                    </div>
+                    <div id="transactionsInfo" class="text-muted" style="font-size:12px;margin-bottom:8px;"></div>
+                    <div id="transactionsList"><p class="text-muted">Загрузка…</p></div>
                 </div>
             </div>
 
@@ -2406,6 +2511,7 @@ document.querySelectorAll('.nav-links a').forEach(link => {
         if (page === 'accounts') loadAccounts();
         if (page === 'property') loadProperties();
         if (page === 'salary') { loadEmployers(); loadEmployees(); loadSalaryHistory(); }
+        if (page === 'transactions') loadTransactions();
         if (page === 'analytics') loadAnalytics();
         if (page === 'banks') loadBanks();
         if (page === 'bonds') loadActiveLoans();
@@ -2676,9 +2782,18 @@ async function loadProperties() {
             <p>${esc(p.area)} м² • ${esc(p.province)}</p>
             <p>Зұт: ${esc(p.year_built)}</p>
             <div class="price ${isP ? 'peseta' : ''}">${fmtMoney(p.price, p.currency)}</div>
-            <button class="btn btn-secondary" onclick="openPurchaseModal('${esc(p.name)}')">Купить</button>`;
+            <button class="btn btn-secondary" onclick="openPurchaseModal('${esc(p.name)}')">Купить</button>
+            <button class="btn btn-secondary" style="margin-left:6px;color:#c0392b;border-color:rgba(192,57,43,0.3);" title="Удалить объект" onclick="deleteProperty('${esc(p.id)}','${esc(p.name)}')"><i class="fas fa-trash"></i></button>`;
         c.appendChild(d);
     });
+}
+async function deleteProperty(id, name) {
+    if (!confirm(`Удалить объект «${name}» (${id}) из реестра?`)) return;
+    const fd = new FormData();
+    fd.append('property_id', id);
+    const r = await apiCall('delete_property', 'POST', fd);
+    if (r.success) loadProperties();
+    else alert(r.message || 'Ошибка удаления');
 }
 document.getElementById('addPropertyForm').addEventListener('submit', async e => {
     e.preventDefault();
@@ -3090,6 +3205,57 @@ async function loadSalaryHistory() {
         h += `<tr><td>${esc(x.date)}</td><td><strong>${Number(x.amount).toLocaleString()}</strong> чякө</td><td>${months[(x.month||1)-1]}</td><td>${x.year||'—'}</td></tr>`;
     });
     c.innerHTML = h + '</tbody></table>';
+}
+
+// ===== ЖУРНАЛ ОПЕРАЦИЙ (вкладка «Операции») =====
+async function loadTransactions() {
+    const acc = (document.getElementById('txAccount').value || '').trim();
+    const limit = document.getElementById('txLimit').value || '100';
+    const listEl = document.getElementById('transactionsList');
+    const infoEl = document.getElementById('transactionsInfo');
+    listEl.innerHTML = '<p class="text-muted">Загрузка…</p>';
+
+    let query = 'get_transactions&limit=' + encodeURIComponent(limit);
+    if (acc) query += '&account=' + encodeURIComponent(acc);
+    const d = await apiCall(query);
+    const rows = (d && d.success && Array.isArray(d.data)) ? d.data : [];
+
+    if (!rows.length) {
+        infoEl.textContent = '';
+        listEl.innerHTML = '<p class="text-muted">' + (acc ? 'Для счёта № ' + esc(acc) + ' операций не найдено.' : 'Журнал операций пуст.') + '</p>';
+        return;
+    }
+
+    infoEl.innerHTML = acc
+        ? `Показано <strong>${rows.length}</strong> опер. по счёту № <strong>${esc(acc)}</strong>`
+        : `Показано <strong>${rows.length}</strong> последних операций`;
+
+    // Сумма в основной валюте + пересчёт во вторую (÷10 для песеты → чякө, ×10 для чякө → песета)
+    const fmt = n => Number(n).toLocaleString(undefined, {maximumFractionDigits: 2});
+    const amountCell = t => {
+        const cur = t.currency === 'песета' ? 'песета' : 'чякө';
+        const main = `<strong>${fmt(t.amount)}</strong> ${cBadge(cur)}`;
+        if (cur === 'песета') return `${main}<div class="tx-alt">≈ ${fmt(Math.round(t.amount / 10 * 100) / 100)} ч.</div>`;
+        return `${main}<div class="tx-alt">≈ ${fmt(Math.round(t.amount * 10 * 100) / 100)} ₧</div>`;
+    };
+
+    let h = '<table class="history-table"><thead><tr>' +
+        '<th>Дата</th><th>ID операции</th><th>Отправитель → Получатель</th>' +
+        '<th style="text-align:right;">Сумма</th><th>Описание</th></tr></thead><tbody>';
+    rows.forEach(t => {
+        const isIncome = acc && t.recipient === acc;
+        const arrow = isIncome
+            ? `<span style="color:#1565c0;">${esc(t.sender)} <i class="fas fa-arrow-right"></i> <strong>Вы</strong></span>`
+            : `<span style="color:#b45309;"><strong>${esc(t.sender)}</strong> <i class="fas fa-arrow-right"></i> ${esc(t.recipient)}</span>`;
+        h += `<tr>
+            <td style="white-space:nowrap;">${esc(t.date)}</td>
+            <td style="font-family:monospace;font-size:11px;color:var(--ink-mute);">${esc(t.id)}</td>
+            <td>${arrow}</td>
+            <td style="text-align:right;white-space:nowrap;">${amountCell(t)}</td>
+            <td>${esc(t.description) || '—'}</td>
+        </tr>`;
+    });
+    listEl.innerHTML = h + '</tbody></table>';
 }
 
 // ===== ANALYTICS =====
