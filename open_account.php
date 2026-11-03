@@ -50,13 +50,21 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
         <label for="bank_name">Нөмә пәнкәлә</label>
         <select id="bank_name" name="bank_name" required>
-            <option value="Цұнат пәнкә">Цұнат пәнкә</option>
-            <option value="Анкел пәнкә">Анкел пәнкә</option>
-            <option value="Инвестыцыйны пәнкә">Инвестыцыйны пәнкә</option>
-            <option value="Тәжашұт пәнкә">Тәжашұт пәнкә</option>
-            <option value="Ёратүрат пәнкә">Ёратүрат пәнкә</option>
-            <option value="Лагбөнат пәнкә">Лагбөнат пәнкә</option>
-            <option value="Banco Bolivariano">Banco Bolivariano</option>
+            <?php
+            // Названия банков синхронизированы с banks.json (дефолты — как в index.php/get_banks)
+            $default_banks = ['Цұнат пәнкә', 'Анкел пәнкә', 'Инвестыцыйны пәнкә', 'Тәжашұт пәнкә', 'Ёратүрат пәнкә', 'Лагбөнат пәнкә', 'Banco Bolivariano'];
+            $banks_file = __DIR__ . '/banks.json';
+            $bank_names = $default_banks;
+            if (file_exists($banks_file)) {
+                $decoded = json_decode(file_get_contents($banks_file), true);
+                if (is_array($decoded) && !empty($decoded)) {
+                    $names = array_values(array_filter(array_map(fn($b) => trim($b['name'] ?? ''), $decoded)));
+                    if ($names) $bank_names = $names;
+                }
+            }
+            foreach ($bank_names as $bn): ?>
+            <option value="<?= htmlspecialchars($bn, ENT_QUOTES) ?>"><?= htmlspecialchars($bn) ?></option>
+            <?php endforeach; ?>
         </select>
 
         <label for="initial_balance">Баланс</label>

@@ -694,6 +694,29 @@ if ($action === 'add_property' && $method === 'POST') {
     exit;
 }
 
+// Удаление объекта недвижимости (по ID или названию) — тот же алгоритм, что в delete_property.php
+if ($action === 'delete_property' && $method === 'POST') {
+    header('Content-Type: application/json');
+    $property_id = trim($_POST['property_id'] ?? '');
+    if (empty($property_id)) { echo json_encode(['success' => false, 'message' => 'ID объекта обязателен']); exit; }
+    if (!file_exists(PROPERTIES_FILE)) { echo json_encode(['success' => false, 'message' => 'Файл объектов не найден']); exit; }
+    $lines = file(PROPERTIES_FILE, FILE_IGNORE_NEW_LINES);
+    $kept = []; $removed = null;
+    foreach ($lines as $line) {
+        if (trim((string)$line) === '') continue;
+        $d = explode('|', $line);
+        if (isset($d[1]) && ($d[1] === $property_id || $d[0] === $property_id)) { $removed = $d[0]; continue; }
+        $kept[] = $line;
+    }
+    if ($removed === null) { echo json_encode(['success' => false, 'message' => 'Объект не найден']); exit; }
+    $content = $kept ? implode("\n", $kept) . "\n" : "";
+    if (file_put_contents(PROPERTIES_FILE, $content, LOCK_EX) !== false)
+        echo json_encode(['success' => true, 'message' => "Объект '$removed' удалён"]);
+    else
+        echo json_encode(['success' => false, 'message' => 'Ошибка сохранения']);
+    exit;
+}
+
 if ($action === 'get_properties') {
     header('Content-Type: application/json');
     $props = [];
@@ -1742,6 +1765,7 @@ if ($action === 'delete_employer' && $method === 'POST') {
     }
     .history-table td strong { color: var(--ink); font-weight: 600; }
     .history-table tr:hover td { background: var(--surface-soft); }
+    .tx-alt { font-size: 11px; color: var(--ink-mute); margin-top: 2px; font-weight: 500; }
 
     /* ===== MISC ===== */
     .footer {
@@ -1810,6 +1834,7 @@ if ($action === 'delete_employer' && $method === 'POST') {
             <li><a data-page="bonds"><i class="fas fa-chart-pie"></i> Облигации</a></li>
             <li><a data-page="property"><i class="fas fa-building"></i> Маеток</a></li>
             <li><a data-page="salary"><i class="fas fa-wallet"></i> Сөләр</a></li>
+            <li><a data-page="transactions"><i class="fas fa-exchange-alt"></i> Операции</a></li>
             <li><a data-page="analytics"><i class="fas fa-chart-pie"></i> Аналитика</a></li>
             <li><a data-page="banks"><i class="fas fa-university"></i> Пәнкәв</a></li>
         </ul>
@@ -2027,6 +2052,26 @@ if ($action === 'delete_employer' && $method === 'POST') {
                         </div>
                         <div id="historyContent"><p class="text-muted">Выберите сотрудника</p></div>
                     </div>
+                </div>
+            </div>
+
+            <div id="page-transactions" class="tab-content">
+                <div class="content-card">
+                    <h2><i class="fas fa-exchange-alt"></i> Операции</h2>
+                    <p class="text-muted mb-16">Единый журнал транзакций: переводы, зарплаты, кредиты, покупка объектов. Суммы указаны в валюте отправителя, автоматически пересчитаны во вторую валюту (курс 1 чякө = 10 ₧).</p>
+                    <div class="flex gap-8 mb-16" style="flex-wrap:wrap;">
+                        <input type="text" class="form-control" id="txAccount" placeholder="Номер счёта (отправитель или получатель)" style="max-width:320px;" onkeydown="if(event.key==='Enter'){event.preventDefault();loadTransactions();}">
+                        <select class="form-control" id="txLimit" style="max-width:140px;">
+                            <option value="50">50 записей</option>
+                            <option value="100" selected>100 записей</option>
+                            <option value="200">200 записей</option>
+                            <option value="500">500 записей</option>
+                        </select>
+                        <button class="btn btn-secondary" onclick="loadTransactions()"><i class="fas fa-search"></i> Показать</button>
+                        <button class="btn btn-secondary" onclick="document.getElementById('txAccount').value='';loadTransactions()"><i class="fas fa-sync"></i> Все операции</button>
+                    </div>
+                    <div id="transactionsInfo" class="text-muted" style="font-size:12px;margin-bottom:8px;"></div>
+                    <div id="transactionsList"><p class="text-muted">Загрузка…</p></div>
                 </div>
             </div>
 
@@ -2466,6 +2511,7 @@ document.querySelectorAll('.nav-links a').forEach(link => {
         if (page === 'accounts') loadAccounts();
         if (page === 'property') loadProperties();
         if (page === 'salary') { loadEmployers(); loadEmployees(); loadSalaryHistory(); }
+        if (page === 'transactions') loadTransactions();
         if (page === 'analytics') loadAnalytics();
         if (page === 'banks') loadBanks();
         if (page === 'bonds') loadActiveLoans();
@@ -2736,9 +2782,18 @@ async function loadProperties() {
             <p>${esc(p.area)} м² • ${esc(p.province)}</p>
             <p>Зұт: ${esc(p.year_built)}</p>
             <div class="price ${isP ? 'peseta' : ''}">${fmtMoney(p.price, p.currency)}</div>
-            <button class="btn btn-secondary" onclick="openPurchaseModal('${esc(p.name)}')">Купить</button>`;
+            <button class="btn btn-secondary" onclick="openPurchaseModal('${esc(p.name)}')">Купить</button>
+            <button class="btn btn-secondary" style="margin-left:6px;color:#c0392b;border-color:rgba(192,57,43,0.3);" title="Удалить объект" onclick="deleteProperty('${esc(p.id)}','${esc(p.name)}')"><i class="fas fa-trash"></i></button>`;
         c.appendChild(d);
     });
+}
+async function deleteProperty(id, name) {
+    if (!confirm(`Удалить объект «${name}» (${id}) из реестра?`)) return;
+    const fd = new FormData();
+    fd.append('property_id', id);
+    const r = await apiCall('delete_property', 'POST', fd);
+    if (r.success) loadProperties();
+    else alert(r.message || 'Ошибка удаления');
 }
 document.getElementById('addPropertyForm').addEventListener('submit', async e => {
     e.preventDefault();
@@ -3150,6 +3205,57 @@ async function loadSalaryHistory() {
         h += `<tr><td>${esc(x.date)}</td><td><strong>${Number(x.amount).toLocaleString()}</strong> чякө</td><td>${months[(x.month||1)-1]}</td><td>${x.year||'—'}</td></tr>`;
     });
     c.innerHTML = h + '</tbody></table>';
+}
+
+// ===== ЖУРНАЛ ОПЕРАЦИЙ (вкладка «Операции») =====
+async function loadTransactions() {
+    const acc = (document.getElementById('txAccount').value || '').trim();
+    const limit = document.getElementById('txLimit').value || '100';
+    const listEl = document.getElementById('transactionsList');
+    const infoEl = document.getElementById('transactionsInfo');
+    listEl.innerHTML = '<p class="text-muted">Загрузка…</p>';
+
+    let query = 'get_transactions&limit=' + encodeURIComponent(limit);
+    if (acc) query += '&account=' + encodeURIComponent(acc);
+    const d = await apiCall(query);
+    const rows = (d && d.success && Array.isArray(d.data)) ? d.data : [];
+
+    if (!rows.length) {
+        infoEl.textContent = '';
+        listEl.innerHTML = '<p class="text-muted">' + (acc ? 'Для счёта № ' + esc(acc) + ' операций не найдено.' : 'Журнал операций пуст.') + '</p>';
+        return;
+    }
+
+    infoEl.innerHTML = acc
+        ? `Показано <strong>${rows.length}</strong> опер. по счёту № <strong>${esc(acc)}</strong>`
+        : `Показано <strong>${rows.length}</strong> последних операций`;
+
+    // Сумма в основной валюте + пересчёт во вторую (÷10 для песеты → чякө, ×10 для чякө → песета)
+    const fmt = n => Number(n).toLocaleString(undefined, {maximumFractionDigits: 2});
+    const amountCell = t => {
+        const cur = t.currency === 'песета' ? 'песета' : 'чякө';
+        const main = `<strong>${fmt(t.amount)}</strong> ${cBadge(cur)}`;
+        if (cur === 'песета') return `${main}<div class="tx-alt">≈ ${fmt(Math.round(t.amount / 10 * 100) / 100)} ч.</div>`;
+        return `${main}<div class="tx-alt">≈ ${fmt(Math.round(t.amount * 10 * 100) / 100)} ₧</div>`;
+    };
+
+    let h = '<table class="history-table"><thead><tr>' +
+        '<th>Дата</th><th>ID операции</th><th>Отправитель → Получатель</th>' +
+        '<th style="text-align:right;">Сумма</th><th>Описание</th></tr></thead><tbody>';
+    rows.forEach(t => {
+        const isIncome = acc && t.recipient === acc;
+        const arrow = isIncome
+            ? `<span style="color:#1565c0;">${esc(t.sender)} <i class="fas fa-arrow-right"></i> <strong>Вы</strong></span>`
+            : `<span style="color:#b45309;"><strong>${esc(t.sender)}</strong> <i class="fas fa-arrow-right"></i> ${esc(t.recipient)}</span>`;
+        h += `<tr>
+            <td style="white-space:nowrap;">${esc(t.date)}</td>
+            <td style="font-family:monospace;font-size:11px;color:var(--ink-mute);">${esc(t.id)}</td>
+            <td>${arrow}</td>
+            <td style="text-align:right;white-space:nowrap;">${amountCell(t)}</td>
+            <td>${esc(t.description) || '—'}</td>
+        </tr>`;
+    });
+    listEl.innerHTML = h + '</tbody></table>';
 }
 
 // ===== ANALYTICS =====
