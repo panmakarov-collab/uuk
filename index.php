@@ -29,6 +29,12 @@ define('CHAKO_PER_PESETA', 10);
 define('BOND_PRICE', 5);
 define('EXTERNAL_TRANSFERS_FILE', 'external_transfers.txt');
 
+// ===== ПАРАМЕТРЫ ЗАРПЛАТНОГО СЕРВИСА =====
+define('SALARY_TAX_RATE', 0.13);        // НДФЛ с начисления
+define('SALARY_FEE_PERCENT', 0.01);     // комиссия банка за перевод (1%)
+define('SALARY_MIN_FEE', ['чякө' => 1.00, 'песета' => 10.00]);      // мин. комиссия в валюте выплаты
+define('SALARY_MAX_FEE', ['чякө' => 5000.00, 'песета' => 50000.00]); // макс. комиссия в валюте выплаты
+
 // ===== ЖУРНАЛ ТРАНЗАКЦИЙ =====
 // Единый формат строки external_transfers.txt (используют index.php, api.php, process_transaction.php):
 // дата|ID транзакции|получатель|отправитель|сумма|описание|валюта
@@ -207,10 +213,14 @@ function get_bank_statistics() {
 //   0: employer_id
 //   1: name
 //   2: account
-//   3: salary
+//   3: salary (оклад в месяц, начисление до налогов)
 //   4: hire_date
 //   5: last_payment
 //   6: salary_currency (чякө | песета), если нет — чякө
+// История выплат (salary_history/<emp_id>.txt), 8 полей через '|':
+//   дата|сумма_начислено|месяц|год|net_на_руки|НДФЛ|комиссия|валюта_выплаты
+//   (первые 4 поля совместимы со старым форматом; старые записи
+//    считаются в чякё, новые хранят суммы в валюте выплаты)
 // ================================================================
 function get_salary_employers() {
     $employers = [];
@@ -253,6 +263,12 @@ function get_salary_employees($employer_id = null) {
     }
     return $employees;
 }
+function get_employee_by_id($employee_id) {
+    foreach (get_salary_employees() as $emp) {
+        if ($emp['id'] === $employee_id) return $emp;
+    }
+    return null;
+}
 function get_salary_history($employee_id) {
     $history = [];
     $file = SALARY_HISTORY_DIR . $employee_id . '.txt';
@@ -260,11 +276,16 @@ function get_salary_history($employee_id) {
         foreach (file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
             $parts = explode('|', $line);
             if (count($parts) >= 4) {
+                $cur = (count($parts) >= 8) ? normalize_currency($parts[7]) : CURRENCY_CHAKO;
                 $history[] = [
                     'date' => $parts[0],
-                    'amount' => floatval($parts[1]),  // всегда в чякө
+                    'amount' => floatval($parts[1]),  // начислено (gross)
                     'month' => $parts[2],
-                    'year' => $parts[3]
+                    'year' => $parts[3],
+                    'net' => isset($parts[4]) ? floatval($parts[4]) : floatval($parts[1]),
+                    'tax' => isset($parts[5]) ? floatval($parts[5]) : 0,
+                    'fee' => isset($parts[6]) ? floatval($parts[6]) : 0,
+                    'currency' => $cur,
                 ];
             }
         }
@@ -275,17 +296,16 @@ function get_last_payment_months($employee_id) {
     $history = get_salary_history($employee_id);
     $months = [];
     foreach ($history as $h) {
-        $months[] = $h['year'] . '-' . str_pad($h['month'], 2, '0', STR_PAD_LEFT);
+        $months[] = $h['year'] . '-' . str_pad(intval($h['month']), 2, '0', STR_PAD_LEFT);
     }
     return array_unique($months);
 }
 function get_missing_months($employee_id) {
-    $employees = get_salary_employees();
-    $employee = null;
-    foreach ($employees as $emp) if ($emp['id'] === $employee_id) { $employee = $emp; break; }
+    $employee = get_employee_by_id($employee_id);
     if (!$employee) return [];
 
     $hire_ts = strtotime($employee['hire_date']);
+    if (!$hire_ts) return [];
     $hy = intval(date('Y', $hire_ts));
     $hm = intval(date('m', $hire_ts));
     $cy = intval(date('Y'));
@@ -305,12 +325,24 @@ function get_missing_months($employee_id) {
 }
 function get_total_debt($employee_id) {
     $missing = get_missing_months($employee_id);
-    $employees = get_salary_employees();
-    $employee = null;
-    foreach ($employees as $emp) if ($emp['id'] === $employee_id) { $employee = $emp; break; }
+    $employee = get_employee_by_id($employee_id);
     if (!$employee) return 0;
     $salary_chako = to_chako($employee['salary'], $employee['salary_currency']);
-    return count($missing) * $salary_chako;
+    return round(count($missing) * $salary_chako, 2);
+}
+// Расчёт зарплаты: из оклада (gross) — НДФЛ, комиссия и сумма «на руки» (net).
+// Все суммы — в валюте оклада.
+function salary_calculate($gross, $currency) {
+    $currency = normalize_currency($currency);
+    $tax  = round($gross * SALARY_TAX_RATE, 2);
+    $base = $gross - $tax;
+    $fee  = round($base * SALARY_FEE_PERCENT, 2);
+    $min  = SALARY_MIN_FEE[$currency];
+    $max  = SALARY_MAX_FEE[$currency];
+    if ($fee < $min) $fee = $min;
+    if ($fee > $max) $fee = $max;
+    $net  = round($base - $fee, 2);
+    return ['gross' => round($gross, 2), 'tax' => $tax, 'fee' => $fee, 'net' => $net, 'currency' => $currency];
 }
 
 // ================================================================
@@ -945,45 +977,122 @@ if ($action === 'get_total_debt') {
     echo json_encode(['debt' => $eid ? get_total_debt($eid) : 0]); exit;
 }
 
+// ===== ЗАРПЛАТА: расчёт (для калькулятора в модалке выплаты) =====
+if ($action === 'salary_calculate') {
+    header('Content-Type: application/json');
+    $amount = floatval(str_replace(',', '.', $_GET['amount'] ?? 0));
+    $cur = normalize_currency($_GET['currency'] ?? CURRENCY_CHAKO);
+    if ($amount <= 0) { echo json_encode(['success' => false, 'message' => 'Некорректная сумма']); exit; }
+    echo json_encode(['success' => true, 'calc' => salary_calculate($amount, $cur)]);
+    exit;
+}
+
+// ===== ЗАРПЛАТА: сводка по сервису (ФОРД / ФОТ / задолженность) =====
+if ($action === 'salary_summary') {
+    header('Content-Type: application/json');
+    $employees = get_salary_employees();
+    $total_ford_chako = 0;      // ФОТ: сумма окладов за текущий месяц в чякө
+    $debt_total_chako = 0;      // суммарная задолженность в чякө
+    $paid_this_month = 0;       // сколько сотрудников уже получили за текущий месяц
+    $per_month = [];            // начислено/выплачено по месяцам (в чякё)
+    $ym_now = date('Y-n');
+    foreach ($employees as $emp) {
+        $salary_chako = to_chako($emp['salary'], $emp['salary_currency']);
+        $total_ford_chako += $salary_chako;
+        $debt_total_chako += get_total_debt($emp['id']);
+        $hist = get_salary_history($emp['id']);
+        $got_now = false;
+        foreach ($hist as $h) {
+            $key = $h['year'] . '-' . intval($h['month']);
+            $gross_chako = to_chako($h['amount'], $h['currency']);
+            if (!isset($per_month[$key])) $per_month[$key] = ['gross' => 0, 'net' => 0, 'tax' => 0, 'fee' => 0];
+            $per_month[$key]['gross'] += $gross_chako;
+            $per_month[$key]['net']   += to_chako($h['net'], $h['currency']);
+            $per_month[$key]['tax']   += to_chako($h['tax'], $h['currency']);
+            $per_month[$key]['fee']   += to_chako($h['fee'], $h['currency']);
+            if ($key === $ym_now) $got_now = true;
+        }
+        if ($got_now) $paid_this_month++;
+    }
+    ksort($per_month);
+    echo json_encode([
+        'success' => true,
+        'employees_count' => count($employees),
+        'ford_chako' => round($total_ford_chako, 2),           // ФОТ за месяц
+        'debt_chako' => round($debt_total_chako, 2),           // долг перед всеми
+        'paid_this_month' => $paid_this_month,
+        'tax_rate' => SALARY_TAX_RATE,
+        'fee_percent' => SALARY_FEE_PERCENT,
+        'per_month' => $per_month,
+    ]);
+    exit;
+}
+
 // ===== ЗАРПЛАТА: выплата =====
+// Выплата всегда идёт за конкретные пропущенные месяцы (или выбранный месяц).
+// НДФЛ и комиссия удерживаются из начисления: сотрудник получает net,
+// работодатель платит полную сумму начисления (gross).
 if ($action === 'pay_salary' && $method === 'POST') {
     header('Content-Type: application/json');
     $eid = trim($_POST['employee_id'] ?? '');
-    $months = intval($_POST['months'] ?? 1);
-    if (empty($eid) || $months < 1) { echo json_encode(['success' => false, 'message' => 'Некорректные данные']); exit; }
+    $months_list = isset($_POST['months_list']) ? trim($_POST['months_list']) : '';
+    $fallback_months = intval($_POST['months'] ?? 0);
 
-    $emp_file = SALARY_EMPLOYEES_DIR . $eid . '.txt';
-    if (!file_exists($emp_file)) { echo json_encode(['success' => false, 'message' => 'Сотрудник не найден']); exit; }
-    $emp_data = file($emp_file, FILE_IGNORE_NEW_LINES);
-    if (count($emp_data) < 5) { echo json_encode(['success' => false, 'message' => 'Некорректные данные']); exit; }
+    if (empty($eid)) { echo json_encode(['success' => false, 'message' => 'Сотрудник не указан']); exit; }
 
-    $employer_id = $emp_data[0];
-    $employee_name = $emp_data[1];
-    $employee_account = $emp_data[2];
-    $salary = floatval($emp_data[3]);
-    $salary_currency = normalize_currency($emp_data[6] ?? CURRENCY_CHAKO);
+    $emp = get_employee_by_id($eid);
+    if (!$emp) { echo json_encode(['success' => false, 'message' => 'Сотрудник не найден']); exit; }
 
-    $employer_file = SALARY_EMPLOYERS_DIR . $employer_id . '.txt';
+    $employer_file = SALARY_EMPLOYERS_DIR . $emp['employer_id'] . '.txt';
     if (!file_exists($employer_file)) { echo json_encode(['success' => false, 'message' => 'Работодатель не найден']); exit; }
     $employer_data = file($employer_file, FILE_IGNORE_NEW_LINES);
-    if (count($employer_data) < 2) { echo json_encode(['success' => false, 'message' => 'Некорректные данные']); exit; }
-    $employer_account = $employer_data[1];
+    if (count($employer_data) < 2) { echo json_encode(['success' => false, 'message' => 'Некорректные данные работодателя']); exit; }
+    $employer_account = trim($employer_data[1]);
 
     $employer_acc = get_account_data($employer_account);
-    $employee_acc = get_account_data($employee_account);
+    $employee_acc = get_account_data($emp['account']);
     if (!$employer_acc) { echo json_encode(['success' => false, 'message' => 'Счёт работодателя не найден']); exit; }
     if (!$employee_acc) { echo json_encode(['success' => false, 'message' => 'Счёт сотрудника не найден']); exit; }
 
-    // Всё считаем в чякө
-    $salary_chako = to_chako($salary, $salary_currency);
-    $total_chako = round($salary_chako * $months, 2);
+    // Определяем, за какие месяцы платим (свежий список пропущенных)
+    $missing_keys = array_flip(get_missing_months($eid));
+    $to_pay = [];
+    if ($months_list !== '') {
+        foreach (explode(',', $months_list) as $item) {
+            $item = trim($item);
+            if ($item === '' || !isset($missing_keys[$item])) continue; // только пропущенные месяцы
+            list($yy, $mm) = array_pad(explode('-', $item), 2, null);
+            if (!$yy || !$mm) continue;
+            $to_pay[] = ['year' => intval($yy), 'month' => intval($mm)];
+        }
+    } elseif ($fallback_months > 0) {
+        $all = [];
+        foreach ($missing_keys as $k => $_) {
+            list($yy, $mm) = explode('-', $k);
+            $all[] = ['year' => intval($yy), 'month' => intval($mm)];
+        }
+        $to_pay = array_slice($all, -$fallback_months);
+    }
 
-    $amount_from_employer = convert_from_chako($total_chako, $employer_acc['currency']);
-    $amount_to_employee = convert_from_chako($total_chako, $employee_acc['currency']);
+    if (!$to_pay) {
+        echo json_encode(['success' => false, 'message' => 'Нет пропущенных месяцев для выплаты (или выбраны уже оплаченные)']);
+        exit;
+    }
+
+    $n = count($to_pay);
+    $gross_total = round($emp['salary'] * $n, 2); // в валюте оклада
+    $calc = salary_calculate($gross_total, $emp['salary_currency']);
+
+    // Конвертация в валюты счетов
+    $gross_chako = to_chako($calc['gross'], $emp['salary_currency']);
+    $net_chako   = to_chako($calc['net'], $emp['salary_currency']);
+    $amount_from_employer = convert_from_chako($gross_chako, $employer_acc['currency']); // списываем начисление
+    $amount_to_employee   = convert_from_chako($net_chako, $employee_acc['currency']);   // зачисляем на руки
 
     if ($employer_acc['balance'] < $amount_from_employer) {
-        echo json_encode(['success' => false, 'message' => "Недостаточно средств. Нужно: {$amount_from_employer} "
-            . currency_short($employer_acc['currency']) . ", доступно: {$employer_acc['balance']}"]);
+        echo json_encode(['success' => false, 'message' => 'Недостаточно средств у работодателя. Нужно: '
+            . number_format($amount_from_employer, 2, ',', ' ') . ' ' . currency_short($employer_acc['currency'])
+            . ', доступно: ' . number_format($employer_acc['balance'], 2, ',', ' ')]);
         exit;
     }
 
@@ -995,27 +1104,50 @@ if ($action === 'pay_salary' && $method === 'POST') {
         echo json_encode(['success' => false, 'message' => 'Ошибка зачисления']); exit;
     }
 
+    // Обновляем файл сотрудника (last_payment, валюта)
+    $emp_file = SALARY_EMPLOYEES_DIR . $eid . '.txt';
+    $emp_data = file($emp_file, FILE_IGNORE_NEW_LINES);
+    while (count($emp_data) < 7) $emp_data[] = '';
     $emp_data[5] = date('Y-m-d H:i:s');
-    while (count($emp_data) < 7) $emp_data[] = ''; // нормализуем длину до 7 полей
-    $emp_data[6] = $salary_currency;
+    $emp_data[6] = $emp['salary_currency'];
     file_put_contents($emp_file, implode("\n", $emp_data) . "\n");
 
-    log_transaction('salary_' . round(microtime(true) * 1000), $employee_account, $employer_account,
-        $amount_to_employee, "Зарплата: $employee_name ($months мес.)", $employee_acc['currency']);
+    // Журнал операций: две проводки — сотруднику (net) и налог/комиссия (удержано)
+    $period_label = implode(', ', array_map(function ($p) { return sprintf('%02d.%d', $p['month'], $p['year']); }, $to_pay));
+    log_transaction('salary_' . round(microtime(true) * 1000), $employee_acc['account_number'], $employer_account,
+        $amount_to_employee, "Зарплата: {$emp['name']} ({$period_label}), на руки", $employee_acc['currency']);
+    $withheld_chako = round($gross_chako - $net_chako, 2);
+    if ($withheld_chako > 0) {
+        log_transaction('salary_tax_' . round(microtime(true) * 1000), 'Бюджет/комиссия', $employer_account,
+            convert_from_chako($withheld_chako, $employer_acc['currency']),
+            "Удержано из зарплаты {$emp['name']} (НДФЛ " . round(SALARY_TAX_RATE * 100) . "% + комиссия " . round(SALARY_FEE_PERCENT * 100) . "%)",
+            $employer_acc['currency']);
+    }
 
-    // История — в чякө
+    // История выплат — помесячно, в валюте оклада
+    if (!is_dir(SALARY_HISTORY_DIR)) mkdir(SALARY_HISTORY_DIR, 0777, true);
     $history_file = SALARY_HISTORY_DIR . $eid . '.txt';
-    $cm = intval(date('m')); $cy = intval(date('Y'));
-    for ($i = 0; $i < $months; $i++) {
-        $month = $cm - $i; $year = $cy;
-        if ($month <= 0) { $month += 12; $year--; }
-        file_put_contents($history_file, date('Y-m-d H:i:s') . "|$salary_chako|$month|$year\n", FILE_APPEND);
+    $share_gross = round($calc['gross'] / $n, 2);
+    $share_net   = round($calc['net'] / $n, 2);
+    $share_tax   = round($calc['tax'] / $n, 2);
+    $share_fee   = round($calc['fee'] / $n, 2);
+    $now = date('Y-m-d H:i:s');
+    foreach ($to_pay as $p) {
+        $line = $now . '|' . $share_gross . '|' . $p['month'] . '|' . $p['year'] . '|'
+              . $share_net . '|' . $share_tax . '|' . $share_fee . '|' . $emp['salary_currency'] . "\n";
+        file_put_contents($history_file, $line, FILE_APPEND | LOCK_EX);
     }
 
     echo json_encode([
         'success' => true,
-        'message' => "Выплачено $amount_to_employee " . currency_short($employee_acc['currency'])
-            . " ($months мес.) сотруднику $employee_name"
+        'message' => "Выплачено {$amount_to_employee} " . currency_short($employee_acc['currency'])
+            . " на руки ({$n} мес.: {$period_label})",
+        'calc' => $calc,
+        'months' => $n,
+        'employee_receives' => $amount_to_employee,
+        'employer_pays' => $amount_from_employer,
+        'employee_currency' => $employee_acc['currency'],
+        'employer_currency' => $employer_acc['currency'],
     ]);
     exit;
 }
@@ -1025,7 +1157,12 @@ if ($action === 'delete_employee' && $method === 'POST') {
     $eid = trim($_POST['employee_id'] ?? '');
     if (empty($eid)) { echo json_encode(['success' => false, 'message' => 'ID обязателен']); exit; }
     $file = SALARY_EMPLOYEES_DIR . $eid . '.txt';
-    if (file_exists($file)) { unlink($file); echo json_encode(['success' => true, 'message' => 'Удалён']); }
+    if (file_exists($file)) {
+        unlink($file);
+        $hf = SALARY_HISTORY_DIR . $eid . '.txt';
+        if (file_exists($hf)) unlink($hf);
+        echo json_encode(['success' => true, 'message' => 'Удалён']);
+    }
     else echo json_encode(['success' => false, 'message' => 'Не найден']);
     exit;
 }
@@ -2024,10 +2161,34 @@ if ($action === 'delete_employer' && $method === 'POST') {
             <div id="page-salary" class="tab-content">
                 <div class="content-card">
                     <h2><i class="fas fa-wallet"></i> Сөләрат сәрвис</h2>
+                    <p class="text-muted mb-16">Оклад — сумма начисления до налогов. При выплате удерживаются НДФЛ 13% и комиссия банка 1% (мин. 1 чякө / 10 ₧). Сотрудник получает сумму «на руки», работодатель платит полное начисление.</p>
+                    <div class="stats-grid" style="margin-bottom:16px;" id="salaryStatsGrid">
+                        <div class="stat-card accent-blue">
+                            <span class="stat-icon"><i class="fas fa-users"></i></span>
+                            <div class="stat-value" id="salStatEmployees">—</div>
+                            <div class="stat-label">сотрудников</div>
+                        </div>
+                        <div class="stat-card accent-green">
+                            <span class="stat-icon"><i class="fas fa-coins"></i></span>
+                            <div class="stat-value" id="salStatFord">—</div>
+                            <div class="stat-label">ФОТ за месяц (чякө)</div>
+                        </div>
+                        <div class="stat-card accent-gold">
+                            <span class="stat-icon"><i class="fas fa-exclamation-triangle"></i></span>
+                            <div class="stat-value" id="salStatDebt">—</div>
+                            <div class="stat-label">задолженность (чякө)</div>
+                        </div>
+                        <div class="stat-card accent-purple">
+                            <span class="stat-icon"><i class="fas fa-check-circle"></i></span>
+                            <div class="stat-value" id="salStatPaid">—</div>
+                            <div class="stat-label">получили в этом месяце</div>
+                        </div>
+                    </div>
                     <div class="tab-bar">
                         <button class="tab-btn active" data-salary-tab="employers">Работодатели</button>
                         <button class="tab-btn" data-salary-tab="employees">Сотрудники</button>
                         <button class="tab-btn" data-salary-tab="history">История</button>
+                        <button class="tab-btn" data-salary-tab="summary">Сводка по месяцам</button>
                     </div>
                     <div id="salary-tab-employers" class="tab-content active">
                         <div class="flex gap-8 mb-16">
@@ -2054,6 +2215,12 @@ if ($action === 'delete_employer' && $method === 'POST') {
                             <button class="btn btn-secondary" onclick="loadSalaryHistory()"><i class="fas fa-sync"></i></button>
                         </div>
                         <div id="historyContent"><p class="text-muted">Выберите сотрудника</p></div>
+                    </div>
+                    <div id="salary-tab-summary" class="tab-content">
+                        <div class="flex gap-8 mb-16">
+                            <button class="btn btn-secondary" onclick="loadSalarySummary()"><i class="fas fa-sync"></i> Обновить</button>
+                        </div>
+                        <div id="salarySummaryContent"><p class="text-muted">Нажмите «Обновить»</p></div>
                     </div>
                 </div>
             </div>
@@ -2382,19 +2549,18 @@ if ($action === 'delete_employer' && $method === 'POST') {
         <button class="modal-close" onclick="closePaySalaryModal()">&times;</button>
         <h2><i class="fas fa-hand-holding-usd"></i> Выплата зарплаты</h2>
         <div id="paySalaryInfo" class="mb-16"></div>
-        <div id="payDebtInfo" class="mb-16"></div>
         <form id="paySalaryForm">
             <input type="hidden" id="payEmployeeId">
-            <div class="form-group"><label>Количество месяцев</label>
-                <select class="form-control" id="payMonths">
-                    <option value="1">1 месяц</option>
-                    <option value="2">2 месяца</option>
-                    <option value="3">3 месяца</option>
-                    <option value="6">6 месяцев</option>
-                    <option value="12">12 месяцев</option>
-                </select>
+            <div class="form-group">
+                <label>Месяцы выплаты (только пропущенные)</label>
+                <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
+                    <button type="button" class="btn btn-secondary" style="padding:4px 10px;font-size:11px;" onclick="setAllPayMonths(true)">Выбрать все</button>
+                    <button type="button" class="btn btn-secondary" style="padding:4px 10px;font-size:11px;" onclick="setAllPayMonths(false)">Снять</button>
+                    <button type="button" class="btn btn-secondary" style="padding:4px 10px;font-size:11px;" onclick="setLastPayMonth()">Только последний</button>
+                </div>
+                <div id="payMissingList" style="max-height:180px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:8px;display:flex;flex-direction:column;gap:4px;"></div>
             </div>
-            <div id="payMissingInfo" class="mb-16"></div>
+            <div id="payCalcBox" class="mb-16" style="font-size:13px;"></div>
             <button type="submit" class="btn btn-success btn-block">Выплатить</button>
         </form>
         <div id="payResult" class="mt-16"></div>
@@ -2513,7 +2679,7 @@ document.querySelectorAll('.nav-links a').forEach(link => {
         if (page === 'dashboard') updateDashboard();
         if (page === 'accounts') loadAccounts();
         if (page === 'property') loadProperties();
-        if (page === 'salary') { loadEmployers(); loadEmployees(); loadSalaryHistory(); }
+        if (page === 'salary') { loadSalaryStats(); loadEmployers(); loadEmployees(); loadSalaryHistory(); }
         if (page === 'transactions') loadTransactions();
         if (page === 'analytics') loadAnalytics();
         if (page === 'banks') loadBanks();
@@ -2541,6 +2707,7 @@ document.querySelectorAll('[data-salary-tab]').forEach(b => b.addEventListener('
     if (this.dataset.salaryTab === 'employers') loadEmployers();
     if (this.dataset.salaryTab === 'employees') loadEmployees();
     if (this.dataset.salaryTab === 'history') loadSalaryHistory();
+    if (this.dataset.salaryTab === 'summary') loadSalarySummary();
 }));
 
 // ===== BANKS =====
@@ -3150,6 +3317,9 @@ document.getElementById('editEmployeeForm').addEventListener('submit', async e =
     }
 });
 
+// ===== Состояние модалки выплаты =====
+let payState = { emp: null, accCur: 'чякө', missing: [] };
+
 async function openPaySalaryModal(id) {
     const emps = await apiCall('get_employees');
     const emp = emps.find(e => e.id === id);
@@ -3157,31 +3327,97 @@ async function openPaySalaryModal(id) {
     const acc = await apiCall('get_account&account=' + emp.account);
     const accCur = acc.success ? acc.currency : 'чякө';
     const salaryCur = emp.salary_currency || 'чякө';
+    const missing = await apiCall('get_missing_months&employee_id=' + id);
 
-    const salaryInChako = salaryCur === 'песета' ? emp.salary / 10 : emp.salary;
-    const amountToEmployee = accCur === 'песета' ? salaryInChako * 10 : salaryInChako;
+    payState = { emp: emp, accCur: accCur, missing: Array.isArray(missing) ? missing : [] };
 
     document.getElementById('payEmployeeId').value = id;
+    document.getElementById('payResult').innerHTML = '';
     document.getElementById('paySalaryInfo').innerHTML = `
         <div style="font-weight:600;">${esc(emp.name)}</div>
         <div style="font-size:13px;color:rgba(26,26,46,0.5);">
-            Оклад: ${fmtMoney(emp.salary, salaryCur)}<br>
-            Счёт: ${esc(emp.account)} ${cBadge(accCur)}<br>
-            За 1 мес. зачислится: <strong>${fmtMoney(amountToEmployee, accCur)}</strong>
+            Оклад (начисление): ${fmtMoney(emp.salary, salaryCur)}<br>
+            Счёт сотрудника: ${esc(emp.account)} ${cBadge(accCur)}<br>
+            Пропущено месяцев: <strong>${payState.missing.length}</strong>
         </div>`;
+
+    const list = document.getElementById('payMissingList');
+    if (!payState.missing.length) {
+        list.innerHTML = '<span class="text-muted" style="font-size:12px;">Все месяцы выплачены ✅</span>';
+    } else {
+        const months = ['Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'];
+        list.innerHTML = payState.missing.map(m => {
+            const key = m.year + '-' + String(m.month).padStart(2, '0');
+            return `<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+                <input type="checkbox" class="pay-month-chk" value="${key}" checked
+                       onchange="updatePayCalc()">
+                <span>${months[(m.month || 1) - 1]} ${m.year}</span>
+            </label>`;
+        }).join('');
+    }
+    updatePayCalc();
     openModal('paySalaryModal');
 }
+
+function getSelectedPayMonths() {
+    return Array.from(document.querySelectorAll('.pay-month-chk:checked')).map(c => c.value);
+}
+function setAllPayMonths(on) {
+    document.querySelectorAll('.pay-month-chk').forEach(c => { c.checked = on; });
+    updatePayCalc();
+}
+function setLastPayMonth() {
+    const chks = document.querySelectorAll('.pay-month-chk');
+    chks.forEach(c => { c.checked = false; });
+    if (chks.length) chks[chks.length - 1].checked = true;
+    updatePayCalc();
+}
+
+async function updatePayCalc() {
+    const box = document.getElementById('payCalcBox');
+    const sel = getSelectedPayMonths();
+    if (!payState.emp || !sel.length) {
+        box.innerHTML = '<span class="text-muted">Выберите хотя бы один месяц</span>';
+        return;
+    }
+    const gross = Number((payState.emp.salary * sel.length).toFixed(2));
+    const r = await apiCall('salary_calculate&amount=' + encodeURIComponent(gross)
+        + '&currency=' + encodeURIComponent(payState.emp.salary_currency || 'чякө'));
+    if (!r.success) { box.innerHTML = '<span class="text-muted">' + esc(r.message || 'Ошибка расчёта') + '</span>'; return; }
+    const c = r.calc;
+    // приведение «на руки» к валюте счёта сотрудника
+    const netChako = c.currency === 'песета' ? c.net / 10 : c.net;
+    const netOnAccount = payState.accCur === 'песета' ? netChako * 10 : netChako;
+    box.innerHTML = `
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:3px 0;color:var(--ink-mute);">Начислено (${sel.length} мес.)</td>
+                <td style="text-align:right;font-weight:600;">${fmtMoney(c.gross, c.currency)}</td></tr>
+            <tr><td style="padding:3px 0;color:var(--ink-mute);">НДФЛ 13%</td>
+                <td style="text-align:right;color:#c62828;">− ${fmtMoney(c.tax, c.currency)}</td></tr>
+            <tr><td style="padding:3px 0;color:var(--ink-mute);">Комиссия банка 1%</td>
+                <td style="text-align:right;color:#c62828;">− ${fmtMoney(c.fee, c.currency)}</td></tr>
+            <tr style="border-top:1px solid var(--line);"><td style="padding:5px 0;font-weight:700;">На руки сотруднику</td>
+                <td style="text-align:right;font-weight:700;color:#2e7d32;">${fmtMoney(c.net, c.currency)}
+                    <small style="color:var(--ink-mute);font-weight:400;">(${fmtMoney(netOnAccount, payState.accCur)} на счёт)</small></td></tr>
+        </table>`;
+    box.dataset.gross = c.gross;
+    box.dataset.net = c.net;
+}
+
 function closePaySalaryModal() { closeModal('paySalaryModal'); }
 document.getElementById('paySalaryForm').addEventListener('submit', async e => {
     e.preventDefault();
+    const sel = getSelectedPayMonths();
+    if (!sel.length) { alert('Выберите месяцы для выплаты'); return; }
+    if (!confirm(`Выплата за ${sel.length} мес.: ${sel.join(', ')}. Продолжить?`)) return;
     const fd = new FormData();
     fd.append('employee_id', document.getElementById('payEmployeeId').value);
-    fd.append('months', document.getElementById('payMonths').value);
+    fd.append('months_list', sel.join(','));
     const r = await apiCall('pay_salary', 'POST', fd);
     const el = document.getElementById('payResult');
     if (r.success) {
         el.innerHTML = `<div style="color:#2e7d32;">✅ ${esc(r.message)}</div>`;
-        setTimeout(() => { closePaySalaryModal(); loadEmployees(); updateDashboard(); }, 1500);
+        setTimeout(() => { closePaySalaryModal(); loadEmployees(); loadSalaryStats(); updateDashboard(); }, 1500);
     } else el.innerHTML = `<div style="color:#c62828;">❌ ${esc(r.message)}</div>`;
 });
 async function loadEmployeesForHistory() {
@@ -3203,11 +3439,68 @@ async function loadSalaryHistory() {
     const data = await apiCall('get_salary_history&employee_id=' + id);
     if (!data || !data.length) { c.innerHTML = '<p class="text-muted">История пуста</p>'; return; }
     const months = ['Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'];
-    let h = '<table class="history-table"><thead><tr><th>Дата</th><th>Сумма (в чякө)</th><th>Месяц</th><th>Год</th></tr></thead><tbody>';
+    let h = `<table class="history-table"><thead><tr>
+        <th>Дата выплаты</th><th>Период</th><th>Начислено</th><th>НДФЛ</th><th>Комиссия</th><th>На руки</th><th>Валюта</th>
+        </tr></thead><tbody>`;
+    let sumGross = 0, sumNet = 0;
     [...data].reverse().forEach(x => {
-        h += `<tr><td>${esc(x.date)}</td><td><strong>${Number(x.amount).toLocaleString()}</strong> чякө</td><td>${months[(x.month||1)-1]}</td><td>${x.year||'—'}</td></tr>`;
+        const cur = x.currency || 'чякө';
+        sumGross += Number(x.amount) || 0;
+        sumNet += Number(x.net != null ? x.net : x.amount) || 0;
+        h += `<tr>
+            <td>${esc(x.date)}</td>
+            <td>${months[(x.month||1)-1]} ${esc(x.year||'—')}</td>
+            <td>${fmtMoney(x.amount, cur)}</td>
+            <td style="color:#c62828;">${Number(x.tax) > 0 ? '− ' + fmtMoney(x.tax, cur) : '—'}</td>
+            <td style="color:#c62828;">${Number(x.fee) > 0 ? '− ' + fmtMoney(x.fee, cur) : '—'}</td>
+            <td style="font-weight:600;color:#2e7d32;">${fmtMoney(x.net != null ? x.net : x.amount, cur)}</td>
+            <td>${cBadge(cur)}</td>
+        </tr>`;
     });
-    c.innerHTML = h + '</tbody></table>';
+    h += `</tbody></table>
+        <p style="font-size:12px;color:var(--ink-mute);margin-top:8px;">
+        Итого начислено: <strong>${sumGross.toLocaleString(undefined,{maximumFractionDigits:2})}</strong> ·
+        получено на руки: <strong>${sumNet.toLocaleString(undefined,{maximumFractionDigits:2})}</strong>
+        (сумма в валюте выплат каждой записи)</p>`;
+    c.innerHTML = h;
+}
+
+// ===== Сводка по зарплатам (статистика + таблица по месяцам) =====
+async function loadSalaryStats() {
+    const s = await apiCall('salary_summary');
+    if (!s || !s.success) return;
+    const el = (id, v) => { const x = document.getElementById(id); if (x) x.textContent = v; };
+    el('salStatEmployees', s.employees_count);
+    el('salStatFord', Number(s.ford_chako).toLocaleString(undefined, {maximumFractionDigits: 2}));
+    el('salStatDebt', Number(s.debt_chako).toLocaleString(undefined, {maximumFractionDigits: 2}));
+    el('salStatPaid', s.paid_this_month);
+}
+async function loadSalarySummary() {
+    const c = document.getElementById('salarySummaryContent');
+    c.innerHTML = '<p class="text-muted">Загрузка…</p>';
+    const s = await apiCall('salary_summary');
+    if (!s || !s.success) { c.innerHTML = '<p class="text-muted">Ошибка загрузки</p>'; return; }
+    const pm = s.per_month || {};
+    const keys = Object.keys(pm).sort();
+    let html = `<p class="text-muted" style="font-size:12px;margin-bottom:8px;">
+        НДФЛ ${Math.round(s.tax_rate*100)}% · комиссия ${Math.round(s.fee_percent*100)}% · все суммы приведены к чякё (1 чякө = 10 ₧)</p>`;
+    if (!keys.length) {
+        c.innerHTML = html + '<p class="text-muted">Выплат ещё не было</p>';
+        return;
+    }
+    html += `<table class="history-table"><thead><tr>
+        <th>Месяц</th><th>Начислено</th><th>НДФЛ + комиссия</th><th>Выплачено на руки</th></tr></thead><tbody>`;
+    keys.forEach(k => {
+        const row = pm[k];
+        const label = k.split('-');
+        const monthNames = ['Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'];
+        html += `<tr><td>${monthNames[(parseInt(label[1],10)||1)-1]} ${esc(label[0])}</td>
+            <td>${Number(row.gross).toLocaleString(undefined,{maximumFractionDigits:2})} чякө</td>
+            <td style="color:#c62828;">${Number(row.tax + row.fee).toLocaleString(undefined,{maximumFractionDigits:2})} чякө</td>
+            <td style="font-weight:600;color:#2e7d32;">${Number(row.net).toLocaleString(undefined,{maximumFractionDigits:2})} чякө</td></tr>`;
+    });
+    html += '</tbody></table>';
+    c.innerHTML = html;
 }
 
 // ===== ЖУРНАЛ ОПЕРАЦИЙ (вкладка «Операции») =====
