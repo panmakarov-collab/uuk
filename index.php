@@ -6,7 +6,9 @@
 
 error_reporting(E_ALL);
 ini_set('display_errors', '0');
-mb_internal_encoding('UTF-8');
+if (function_exists('mb_internal_encoding')) {
+    mb_internal_encoding('UTF-8');
+}
 
 // ===== НАСТРОЙКИ =====
 define('ACCOUNTS_DIR', 'accounts/');
@@ -770,7 +772,8 @@ if ($action === 'buy_property' && $method === 'POST') {
     // Единый формат purchases.txt: название|ID продажи|счёт покупателя|цена для покупателя|валюта покупателя
     file_put_contents(PURCHASES_FILE, "$prop|$sale|$num|$price_for_buyer|{$buyer['currency']}\n", FILE_APPEND);
     unset($props[$idx]);
-    file_put_contents(PROPERTIES_FILE, implode("\n", array_filter($props, fn($l) => trim((string)$l) !== '')));
+    $filtered = array_filter($props, function ($l) { return trim((string)$l) !== ''; });
+    file_put_contents(PROPERTIES_FILE, implode("\n", $filtered));
     update_account_balance($num, $buyer['balance'] - $price_for_buyer);
     log_transaction('sale_' . $sale, '983902849056', $num, $price_for_buyer, "Покупка объекта: $prop", $buyer['currency']);
 
